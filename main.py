@@ -2,69 +2,106 @@ import pandas as pd
 import numpy as np
 from graphviz import Digraph
 
-
-# Sample Data for Vancouver Bus Network
+# Data with Station Names and Monthly Average Passengers
 data = {
     "Station": ["L1", "L21", "L22", "L23", "L31", "L32", "L33", "L34", "L35"],
-    "Route": [
-        "L1 > L21", "L1 > L22","L1 > L23" ,
-        "L21 > L31", "L21 > L32", "L21 > L33",
-        "L22 > L33", "L22 > L34", "L23 > L35",
-    ],
-    "Total Passengers": [30, 14, 6, 10, 7, 4, 1, 5, 10],
-    "Alighting": [5, 4, 6, 3, 2, 4, 3, 2, 5],
-    "To Next": [15, 20, 12, 10, 8, 7, 5, 3, 0],
-    "Transfer": [10, 1, 2, 5, 3, 1, 0, 1, 0],
-    "Epsilon": [1.0, 0.8, 0.6, 0.7, 0.9, 0.8, 0.5, 0.7, 0.6],
+    "Average Passengers": [35, 20, 15, 25, 12, 18, 8, 10, 14],
 }
 
 df = pd.DataFrame(data)
 
-# Add original records for comparison
-df["Original Total"] = df["Total Passengers"].copy()
+# Define Station Hierarchy (Parent-Child Relationships)
+routes = {
+    "L1": ["L21", "L22", "L23"],
+    "L21": ["L31", "L32", "L33"],
+    "L22": ["L33", "L34"],
+    "L23": ["L35"],
+}
 
-# Differential Privacy Function
-def add_laplace_noise(counts, sensitivity, epsilon):
+# Function for Dynamic Epsilon Assignment
+def calculate_epsilon(data, base_epsilon=0.5, decay_rate=0.1):
     """
-    Adds Laplace noise to counts with adjustable epsilon.
+    Assigns dynamic epsilon values with decreasing noise as we move down the hierarchy.
+    Epsilon values reduce based on the depth level of each station.
     """
-    noise = np.random.laplace(0, sensitivity / epsilon, size=len(counts))
-    return np.maximum(0, np.round(counts + noise))  # Ensure non-negative counts
+    epsilon_values = {}
+    depth = {station: 0 for station in data["Station"]}
 
-# Add noise to the dataset
-df["Total Passengers"] = add_laplace_noise(df["Total Passengers"], sensitivity=1, epsilon=df["Epsilon"])
+    # Calculate depth for each station in the hierarchy
+    for parent, children in routes.items():
+        for child in children:
+            depth[child] = depth[parent] + 1
 
-# Prune stations with no passengers remaining
-df = df[df["Total Passengers"] > 0]
+    # Assign epsilon dynamically
+    max_depth = max(depth.values())
+    for station, station_depth in depth.items():
+        epsilon_values[station] = base_epsilon - (station_depth * decay_rate)
+        epsilon_values[station] = max(0.1, epsilon_values[station])  # Ensure epsilon >= 0.1
+
+    return epsilon_values
+
+# Assign Epsilon to Stations
+epsilon_values = calculate_epsilon(df)
+df["Epsilon"] = df["Station"].map(epsilon_values)
+
+# Differential Privacy with Laplace Noise
+def add_laplace_noise(data, sensitivity, epsilon):
+    """
+    Adds Laplace noise to passenger data while ensuring non-negative counts.
+    """
+    noise = np.random.laplace(0, sensitivity / epsilon, size=len(data))
+    return np.maximum(0, np.round(data + noise))  # Ensure non-negative values
+
+# Add Laplace Noise to Passengers
+sensitivity = 1  # Sensitivity of one passenger
+df["Noisy Passengers"] = add_laplace_noise(df["Average Passengers"], sensitivity, df["Epsilon"])
+
+# Enforce Parent-Child Constraints
+def enforce_parent_child_constraints(routes, station_data):
+    """
+    Ensures the sum of children values does not exceed the parent value.
+    Adjusts children values dynamically while preserving relative proportions.
+    """
+    for parent, children in routes.items():
+        parent_noisy = station_data.loc[station_data["Station"] == parent, "Noisy Passengers"].iloc[0]
+        child_values = station_data[station_data["Station"].isin(children)]["Noisy Passengers"]
+
+        if child_values.sum() > parent_noisy:
+            # Scale children values to respect the parent constraint
+            scale = parent_noisy / child_values.sum()
+            station_data.loc[station_data["Station"].isin(children), "Noisy Passengers"] = np.floor(
+                child_values * scale
+            )
+    return station_data
+
+df = enforce_parent_child_constraints(routes, df)
 
 # Generate Tree Visualization
-def generate_tree(data):
+def generate_tree(data, routes):
     """
-    Generates a realistic branching tree diagram for Vancouver's bus network.
+    Generates a tree diagram for Vancouver's bus network.
     """
-    dot = Digraph(format='svg')  # Output as SVG
-    dot.attr(rankdir="TB", size="12,8")  # Top-to-Bottom
+    dot = Digraph(format='svg')
+    dot.attr(rankdir="TB", size="12,8")
     dot.attr("node", shape="ellipse", style="filled", fillcolor="lightblue")
 
     # Add nodes with both original and noisy data
     for _, row in data.iterrows():
         station = row["Station"]
-        orig_label = f"Original: {row['Original Total']}"
-        noisy_label = f"Noisy: {row['Total Passengers']}"
+        orig_label = f"Original: {row['Average Passengers']}"
+        noisy_label = f"Noisy: {row['Noisy Passengers']}"
         dot.node(station, f"{station}\\n{orig_label}\\n{noisy_label}")
 
     # Add edges for each route
-    for route in data["Route"].unique():
-        stops = route.split(" > ")
-        for i in range(len(stops) - 1):
-            if stops[i] in data["Station"].values and stops[i + 1] in data["Station"].values:
-                dot.edge(stops[i], stops[i + 1])
+    for parent, children in routes.items():
+        for child in children:
+            dot.edge(parent, child)
 
     return dot
 
-# Generate the tree diagram
-tree = generate_tree(df)
-output_path = "vancouver_bus_tree"
+# Generate and Save Tree Diagram
+tree = generate_tree(df, routes)
+output_path = "vancouver_bus_hierarchy"
 tree.render(output_path, cleanup=True)
 
 print(f"Tree diagram saved as {output_path}.svg")
